@@ -8,7 +8,7 @@
         * {
             margin: 0;
             padding: 0;
-            box-sizing: border-box;analyzer
+            box-sizing: border-box;
         }
 
         body {
@@ -212,7 +212,7 @@
                 grid-template-columns: 1fr;
             }
             
-            .controls {analyzer
+            .controls {
                 flex-direction: column;
                 align-items: center;
             }
@@ -263,10 +263,11 @@
         <div class="instructions">
             <h3>Setup Instructions:</h3>
             <ul>
-                <li>Place a white marker (paper/sticker) on your chest</li>
-                <li>Wear dark clothing for better contrast</li>
-                <li>Ensure good lighting on the white marker</li>
-                <li>Keep your phone/camera steady</li>
+                <li><strong>Wear a WHITE shirt</strong> or place white paper on your chest</li>
+                <li>Place a <strong>BLACK circle/dot</strong> (marker, sticker, coin) on the white area</li>
+                <li>Ensure good lighting so black dot is clearly visible</li>
+                <li><strong>Draw a rectangle around your chest area</strong> by dragging on the video</li>
+                <li>The rectangle should cover where your breathing motion occurs</li>
                 <li>Allow camera permissions when prompted</li>
             </ul>
         </div>
@@ -333,9 +334,15 @@
                 this.dataPoints = [];
                 this.startTime = null;
                 this.trackingQuality = 0;
-                this.lastPosition = null;
+                this.lastPixelCount = null;
+                
+                // ROI (Region of Interest) variables
+                this.roi = null;
+                this.isDrawingROI = false;
+                this.roiStart = null;
                 
                 this.setupVideo();
+                this.setupROIEvents();
                 this.updateSessionTimer();
             }
 
@@ -349,6 +356,71 @@
                     };
                 } catch (error) {
                     console.error('Video setup error:', error);
+                }
+            }
+
+            setupROIEvents() {
+                // Mouse events for desktop
+                this.canvas.addEventListener('mousedown', (e) => this.startROI(e));
+                this.canvas.addEventListener('mousemove', (e) => this.updateROI(e));
+                this.canvas.addEventListener('mouseup', (e) => this.finishROI(e));
+                
+                // Touch events for mobile
+                this.canvas.addEventListener('touchstart', (e) => {
+                    e.preventDefault();
+                    this.startROI(e.touches[0]);
+                });
+                this.canvas.addEventListener('touchmove', (e) => {
+                    e.preventDefault();
+                    this.updateROI(e.touches[0]);
+                });
+                this.canvas.addEventListener('touchend', (e) => {
+                    e.preventDefault();
+                    this.finishROI(e);
+                });
+            }
+
+            getCanvasCoordinates(event) {
+                const rect = this.canvas.getBoundingClientRect();
+                const scaleX = this.canvas.width / rect.width;
+                const scaleY = this.canvas.height / rect.height;
+                
+                return {
+                    x: (event.clientX - rect.left) * scaleX,
+                    y: (event.clientY - rect.top) * scaleY
+                };
+            }
+
+            startROI(event) {
+                if (this.isMonitoring) return; // Don't allow ROI changes during monitoring
+                
+                this.isDrawingROI = true;
+                this.roiStart = this.getCanvasCoordinates(event);
+                this.roi = null; // Clear existing ROI
+            }
+
+            updateROI(event) {
+                if (!this.isDrawingROI) return;
+                
+                const current = this.getCanvasCoordinates(event);
+                const width = current.x - this.roiStart.x;
+                const height = current.y - this.roiStart.y;
+                
+                this.roi = {
+                    x: Math.min(this.roiStart.x, current.x),
+                    y: Math.min(this.roiStart.y, current.y),
+                    width: Math.abs(width),
+                    height: Math.abs(height)
+                };
+            }
+
+            finishROI(event) {
+                this.isDrawingROI = false;
+                if (this.roi && (this.roi.width < 20 || this.roi.height < 20)) {
+                    this.roi = null; // Remove tiny rectangles
+                    this.updateStatus('ROI too small. Draw a larger rectangle.', 'error');
+                } else if (this.roi) {
+                    this.updateStatus('ROI selected. Click Start Monitoring to begin.', 'ready');
                 }
             }
 
@@ -387,23 +459,30 @@
 
             async toggleMonitoring() {
                 if (!this.isMonitoring) {
+                    // Check if ROI is set
+                    if (!this.roi) {
+                        this.updateStatus('Please draw a rectangle on your chest area first!', 'error');
+                        return;
+                    }
+                    
                     const cameraStarted = await this.startCamera();
                     if (!cameraStarted) return;
                     
                     this.isMonitoring = true;
                     this.startTime = Date.now();
                     this.dataPoints = [];
+                    this.lastPixelCount = null;
                     document.getElementById('startBtn').textContent = 'Stop Monitoring';
-                    this.updateStatus('Monitoring active - tracking physiological signals', 'monitoring');
+                    this.updateStatus('Monitoring active - tracking black pixels in ROI', 'monitoring');
                     document.getElementById('trackingIndicator').classList.add('active');
                     this.monitoringLoop();
                 } else {
                     this.isMonitoring = false;
                     this.stopCamera();
                     document.getElementById('startBtn').textContent = 'Start Monitoring';
-                    this.updateStatus('Monitoring stopped', 'ready');
+                    this.updateStatus('Monitoring stopped. You can redraw ROI if needed.', 'ready');
                     document.getElementById('trackingIndicator').classList.remove('active');
-                    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+                    // Keep the last frame visible
                 }
             }
 
@@ -430,51 +509,55 @@
             }
 
             detectWhiteMarker() {
-                const imageData = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
+                // If no ROI is set, return null
+                if (!this.roi) {
+                    return null;
+                }
+
+                const imageData = this.ctx.getImageData(this.roi.x, this.roi.y, this.roi.width, this.roi.height);
                 const data = imageData.data;
                 
-                let maxWhiteIntensity = 0;
-                let bestPosition = null;
-                const threshold = 200; // Brightness threshold for white detection
-                const searchRadius = 20;
+                let blackPixelCount = 0;
+                const threshold = 80; // Darkness threshold for black detection (lower = darker)
                 
-                // Sample points to find brightest white area
-                for (let y = searchRadius; y < this.canvas.height - searchRadius; y += 5) {
-                    for (let x = searchRadius; x < this.canvas.width - searchRadius; x += 5) {
-                        const index = (y * this.canvas.width + x) * 4;
-                        const r = data[index];
-                        const g = data[index + 1];
-                        const b = data[index + 2];
-                        
-                        // Calculate brightness and whiteness
-                        const brightness = (r + g + b) / 3;
-                        const whiteness = Math.min(r, g, b); // All RGB components should be high for white
-                        
-                        if (brightness > threshold && whiteness > threshold - 50) {
-                            const intensity = brightness + whiteness;
-                            if (intensity > maxWhiteIntensity) {
-                                maxWhiteIntensity = intensity;
-                                bestPosition = { x, y };
-                            }
-                        }
+                // Count black pixels in the ROI
+                for (let i = 0; i < data.length; i += 4) {
+                    const r = data[i];
+                    const g = data[i + 1];
+                    const b = data[i + 2];
+                    
+                    // Calculate darkness (inverse of brightness)
+                    const brightness = (r + g + b) / 3;
+                    const blackness = Math.max(r, g, b); // For black, all RGB should be low
+                    
+                    if (brightness < threshold && blackness < threshold + 30) {
+                        blackPixelCount++;
                     }
                 }
                 
-                return bestPosition;
+                // Return the pixel count as our signal
+                return {
+                    x: this.roi.x + this.roi.width / 2,
+                    y: this.roi.y + this.roi.height / 2,
+                    pixelCount: blackPixelCount,
+                    totalPixels: (this.roi.width * this.roi.height)
+                };
             }
 
-            processPhysiologicalSignal(position) {
+            processPhysiologicalSignal(detectionResult) {
                 const timestamp = Date.now();
                 const relativeTime = (timestamp - this.startTime) / 1000; // seconds
                 
-                // Calculate movement-based signal
+                // Calculate pixel-based signal
+                const pixelCount = detectionResult.pixelCount;
+                const pixelRatio = pixelCount / detectionResult.totalPixels;
+                
+                // Calculate change in pixel count for signal
                 let signal = 0;
-                if (this.lastPosition) {
-                    const dx = position.x - this.lastPosition.x;
-                    const dy = position.y - this.lastPosition.y;
-                    signal = Math.sqrt(dx * dx + dy * dy);
+                if (this.lastPixelCount !== null) {
+                    signal = pixelCount - this.lastPixelCount;
                 }
-                this.lastPosition = position;
+                this.lastPixelCount = pixelCount;
                 
                 // Apply frequency-specific processing
                 const filteredSignal = this.applyFrequencyFilter(signal, relativeTime);
@@ -485,8 +568,10 @@
                     relativeTime: relativeTime,
                     rawSignal: signal,
                     filteredSignal: filteredSignal,
+                    pixelCount: pixelCount,
+                    pixelRatio: pixelRatio,
                     frequency: this.frequency,
-                    position: position
+                    roiArea: detectionResult.totalPixels
                 });
                 
                 // Update display
@@ -550,9 +635,9 @@
                 }
 
                 const csvContent = [
-                    'Timestamp,RelativeTime(s),RawSignal,FilteredSignal,Frequency(Hz),PositionX,PositionY',
+                    'Timestamp,RelativeTime(s),RawSignal,FilteredSignal,BlackPixelCount,BlackPixelRatio,Frequency(Hz),ROIArea',
                     ...this.dataPoints.map(point => 
-                        `${point.timestamp},${point.relativeTime.toFixed(3)},${point.rawSignal.toFixed(6)},${point.filteredSignal.toFixed(6)},${point.frequency},${point.position.x},${point.position.y}`
+                        `${point.timestamp},${point.relativeTime.toFixed(3)},${point.rawSignal.toFixed(6)},${point.filteredSignal.toFixed(6)},${point.pixelCount},${point.pixelRatio.toFixed(6)},${point.frequency},${point.roiArea}`
                     )
                 ].join('\n');
 
@@ -560,7 +645,7 @@
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `biomarker_data_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.csv`;
+                a.download = `biomarker_black_pixel_data_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.csv`;
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
